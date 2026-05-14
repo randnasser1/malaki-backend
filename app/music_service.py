@@ -14,8 +14,15 @@ except ImportError:
     RAPIDFUZZ_AVAILABLE = False
     print("⚠️ rapidfuzz not installed — fuzzy CSV lookup disabled")
 
-RECCOBEATS_HOST = "reccobeats1.p.rapidapi.com"
-RECCOBEATS_BASE = f"https://{RECCOBEATS_HOST}"
+try:
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials
+    SPOTIPY_AVAILABLE = True
+except ImportError:
+    SPOTIPY_AVAILABLE = False
+    print("⚠️ spotipy not installed — Spotify search disabled")
+
+RECCOBEATS_BASE = "https://api.reccobeats.com/v1"
 
 # Columns the RF model expects (must match inference.py feature_array order)
 RF_FEATURE_ORDER = [
@@ -44,9 +51,10 @@ class MusicService:
         self.engine = inference_engine
         self.df: Optional[pd.DataFrame] = None
         self._search_keys: List[str] = []
-        self._api_key: str = os.getenv("RAPIDAPI_KEY", "")
         self._track_cache: Dict[str, Tuple[str, str]] = {}  # (artist|track) → (emotion, source)
+        self._sp: Optional["spotipy.Spotify"] = None
         self._load_csv(csv_path)
+        self._init_spotify()
 
     def _load_csv(self, path: str):
         try:
@@ -60,6 +68,25 @@ class MusicService:
             print(f"✅ audio_features_clean.csv loaded: {len(self.df):,} tracks")
         except Exception as e:
             print(f"⚠️ Could not load audio_features_clean.csv: {e}")
+
+    def _init_spotify(self):
+        if not SPOTIPY_AVAILABLE:
+            return
+        client_id = os.getenv("SPOTIFY_CLIENT_ID", "")
+        client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+        if not client_id or not client_secret:
+            print("⚠️ SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET not set — Spotify search disabled")
+            return
+        try:
+            self._sp = spotipy.Spotify(
+                client_credentials_manager=SpotifyClientCredentials(
+                    client_id=client_id,
+                    client_secret=client_secret,
+                )
+            )
+            print("✅ Spotipy client initialised")
+        except Exception as e:
+            print(f"⚠️ Spotipy init failed: {e}")
 
     # ── 1. Fuzzy CSV lookup ───────────────────────────────────────────────────
 
@@ -78,38 +105,48 @@ class MusicService:
                 return str(row.iloc[0]["emotion"])
         return None
 
-    # ── 2. Reccobeats API ─────────────────────────────────────────────────────
+    # ── 2. Spotify search + ReccoBeats audio features ─────────────────────────
+
+    def _spotify_search_id(self, artist: str, track: str) -> Optional[str]:
+        """Return the Spotify track ID for artist+track, or None."""
+        if self._sp is None:
+            return None
+        try:
+            results = self._sp.search(
+                q=f"artist:{artist} track:{track}", type="track", limit=1
+            )
+            items = (results or {}).get("tracks", {}).get("items", [])
+            if items:
+                return items[0]["id"]
+        except Exception as e:
+            print(f"⚠️ Spotify search failed for '{artist} - {track}': {e}")
+        return None
 
     async def fetch_reccobeats_features(
         self, artist: str, track: str
     ) -> Optional[Dict[str, float]]:
-        """Fetch audio features from Reccobeats via RapidAPI."""
-        if not self._api_key:
+        """Search Spotify for the track ID, then fetch audio features from ReccoBeats."""
+        spotify_id = await asyncio.get_event_loop().run_in_executor(
+            None, self._spotify_search_id, artist, track
+        )
+        if not spotify_id:
             return None
-        query = f"{artist} {track}"
-        headers = {
-            "x-rapidapi-key": self._api_key,
-            "x-rapidapi-host": RECCOBEATS_HOST,
-        }
+
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(
-                    f"{RECCOBEATS_BASE}/track",
-                    params={"q": query, "limit": "1"},
-                    headers=headers,
+                    f"{RECCOBEATS_BASE}/audio-features",
+                    params={"ids": spotify_id},
+                    headers={"Accept": "application/json"},
                 )
                 resp.raise_for_status()
                 data = resp.json()
 
-            # Reccobeats wraps results under "content" key
-            items = data.get("content") or data.get("tracks") or data.get("items") or []
-            if not items:
+            tracks = data.get("content", [])
+            if not tracks:
                 return None
 
-            af = items[0].get("audioFeatures") or items[0].get("audio_features") or {}
-            if not af:
-                return None
-
+            af = tracks[0]
             return {
                 "valence":          float(af.get("valence",          RF_DEFAULTS["valence"])),
                 "energy":           float(af.get("energy",           RF_DEFAULTS["energy"])),
@@ -124,7 +161,7 @@ class MusicService:
                 "mode":             float(af.get("mode",             RF_DEFAULTS["mode"])),
             }
         except Exception as e:
-            print(f"⚠️ Reccobeats failed for '{artist} - {track}': {e}")
+            print(f"⚠️ ReccoBeats failed for '{artist} - {track}' (id={spotify_id}): {e}")
             return None
 
     # ── 3. RF classification ─────────────────────────────────────────────────
@@ -169,8 +206,8 @@ class MusicService:
     ) -> Optional[Tuple[str, str]]:
         """
         Returns (emotion, source) or None if no data is available.
-        source is one of: 'csv', 'rf_reccobeats'.
-        Returns None when both CSV and ReccoBeats fail — caller must skip the track.
+        source is one of: 'csv', 'rf_spotify_reccobeats'.
+        Returns None when both CSV and Spotify+ReccoBeats fail — caller must skip the track.
         """
         cache_key = f"{_norm(artist)}|||{_norm(track)}"
         if cache_key in self._track_cache:
@@ -188,7 +225,7 @@ class MusicService:
         if features:
             emotion = self.classify_from_features(features)
             if emotion:
-                result = (emotion, "rf_reccobeats")
+                result = (emotion, "rf_spotify_reccobeats")
                 self._track_cache[cache_key] = result
                 self._append_to_csv(artist, track, emotion, features)
                 return result
@@ -227,7 +264,7 @@ class MusicService:
 
             emotion, source = result
 
-            if source == "rf_reccobeats":
+            if source == "rf_spotify_reccobeats":
                 reccobeats_calls += 1
                 if reccobeats_calls % 5 == 0:
                     await asyncio.sleep(1)

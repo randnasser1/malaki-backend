@@ -169,28 +169,24 @@ class FirestoreService:
         })
 
     async def get_music_emotion_series(self, child_id: str, days: int = 30) -> List[Dict]:
+        """Return [{date, emotion}] for TBATS analysis."""
         cutoff = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
 
         print(f"🔍 Fetching music emotion series for child {child_id}")
-        print(f"   Cutoff timestamp: {cutoff}")
-
         docs = self.db.collection("music_tracking")\
             .where("childId", "==", child_id)\
             .limit(100)\
             .stream()
 
         series = []
-        doc_count = 0
         for doc in docs:
             d = doc.to_dict()
-            if not d.get("emotion_processed"):
+            if not d.get("emotion_processed", False):
                 continue
             if d.get("timestamp", 0) < cutoff:
                 continue
-            doc_count += 1
+            
             emotion_results = d.get("emotion_results", [])
-            print(f"   Doc {doc_count}: {len(emotion_results)} emotion_results")
-
             for entry in emotion_results:
                 emotion = entry.get("emotion")
                 date_str = entry.get("date")
@@ -198,18 +194,13 @@ class FirestoreService:
                     ts = entry.get("timestamp")
                     if ts:
                         date_str = datetime.utcfromtimestamp(ts / 1000).strftime("%Y-%m-%d")
-
                 if date_str and emotion:
                     series.append({"date": date_str, "emotion": emotion})
         
         print(f"📊 Total entries for TBATS: {len(series)}")
-        if series:
-            print(f"   Sample: {series[:3]}")
-        else:
-            print("   ⚠️ NO valid entries found!")
-        
         return series
 
+    
     async def get_music_emotion_summary(self, child_id: str) -> Dict:
         """Aggregate dominant RF emotion from the last 10 processed music_tracking docs."""
         MOOD_LABEL = {
@@ -253,21 +244,6 @@ class FirestoreService:
             "total_tracks":        total_tracks,
         }
 
-    async def get_app_usage_series(self, child_id: str, days: int = 30) -> List[Dict]:
-        """Return [{date, totalTimeMin}] for TBATS analysis."""
-        cutoff = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-        docs = self.db.collection("app_usage")\
-            .where("childId", "==", child_id)\
-            .limit(60)\
-            .stream()
-        rows = [
-            {"date": d.to_dict().get("date"), "totalTimeMin": d.to_dict().get("totalTimeMin", 0)}
-            for d in docs
-            if d.to_dict().get("date") and d.to_dict().get("timestamp", 0) >= cutoff
-        ]
-        rows.sort(key=lambda x: x["date"])
-        return rows
-
     async def get_app_usage_full_series(self, child_id: str, days: int = 30) -> List[Dict]:
         """Return [{date, totalTimeMin, apps}] for per-category TBATS analysis."""
         cutoff = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
@@ -287,18 +263,34 @@ class FirestoreService:
         rows.sort(key=lambda x: x["date"])
         return rows
 
-    # ── TBATS results persistence ─────────────────────────────────────────────
+    async def get_app_usage_series(self, child_id: str, days: int = 30) -> List[Dict]:
+        """Return [{date, totalTimeMin}] for TBATS analysis."""
+        cutoff = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        docs = self.db.collection("app_usage")\
+            .where("childId", "==", child_id)\
+            .limit(60)\
+            .stream()
+        rows = []
+        for doc in docs:
+            data = doc.to_dict()
+            if data.get("date") and data.get("timestamp", 0) >= cutoff:
+                rows.append({
+                    "date": data["date"],
+                    "totalTimeMin": data.get("totalTimeMin", 0)
+                })
+        rows.sort(key=lambda x: x["date"])
+        return rows
+
 
     async def save_tbats_cache(self, child_id: str, result: Dict):
         """Save the full /analyze/tbats response to the top-level tbats_cache collection."""
         self.db.collection("tbats_cache").document(child_id)\
             .set({**result, "cached_at": int(datetime.now().timestamp() * 1000)})
-
+        
     async def get_tbats_cache(self, child_id: str) -> Optional[Dict]:
         """Return the cached full TBATS response, or None if it doesn't exist yet."""
         doc = self.db.collection("tbats_cache").document(child_id).get()
         return doc.to_dict() if doc.exists else None
-
     async def get_social_score(self, child_id: str) -> Optional[int]:
         docs = self.db.collection("app_usage")\
             .where("childId", "==", child_id)\

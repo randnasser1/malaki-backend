@@ -21,6 +21,23 @@ from google.oauth2 import service_account
 import requests
 from datetime import datetime
 import warnings
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from parent directory (one level up from app/)
+env_path = Path(__file__).parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
+
+# Verify Spotify credentials are loaded
+spotify_id = os.getenv("SPOTIFY_CLIENT_ID")
+spotify_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+if spotify_id and spotify_secret:
+    print(f"✅ Spotify credentials loaded from .env (ID: {spotify_id[:5]}...)")
+else:
+    print(f"⚠️ Spotify credentials NOT loaded. Check .env file at {env_path}")
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="google")
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -562,6 +579,54 @@ async def _refresh_tbats_cache(child_id: str, days: int):
         log.info("TBATS background refresh complete for %s", child_id)
     except Exception as e:
         log.error("TBATS background refresh failed for %s: %s", child_id, e)
+# Add this after your existing endpoints (around line 300)
+
+@app.post("/music/track")
+async def music_track_received(track_data: dict, background_tasks: BackgroundTasks):
+    """Called by Android when new music is tracked - triggers background processing"""
+    child_id = track_data.get("childId")
+    if child_id:
+        background_tasks.add_task(process_child_music, child_id)
+        log.info(f"🎵 Queued music processing for child {child_id}")
+    return {"status": "queued"}
+
+# Add this after your wellbeing/daily endpoint (around line 150)
+
+@app.post("/journal/analyze")
+async def analyze_journal(request: dict):
+    """Analyze journal text for emotions using DistilBERT"""
+    child_id = request.get("childId")
+    journal_text = request.get("text", "")
+    date = request.get("date")
+    
+    if not journal_text or not child_id:
+        return {"status": "skipped", "reason": "missing data"}
+    
+    # Run DistilBERT analysis
+    sentiment_result = inference_engine.analyze_sentiment(journal_text)
+    
+    if "error" not in sentiment_result:
+        # Save to event_analysis for dashboard trends
+        await firestore.save_event_analysis(
+            child_id=child_id,
+            event_id=f"journal_{child_id}_{date}",
+            event_type="JOURNAL",
+            sentiment_score=sentiment_result["sentiment_score"],
+            emotion_vector=sentiment_result.get("emotion_vector", {}),
+            grooming_prob=0.0,
+            risk_level="LOW",
+            risk_score=0.0,
+            anomaly_score=0.0,
+            explanation="Journal entry analyzed",
+            timestamp_utc=int(datetime.now().timestamp() * 1000),
+            message_text=journal_text[:500],
+            author_label=None,
+            author_confidence=None
+        )
+        log.info(f"📝 Journal analyzed for {child_id}: sentiment={sentiment_result['sentiment_score']:.3f}")
+        return {"status": "analyzed", "sentiment": sentiment_result["sentiment_score"]}
+    
+    return {"status": "failed", "error": sentiment_result.get("error")}
 
 
 @app.get("/analyze/tbats/{child_id}")
@@ -622,3 +687,4 @@ def calculate_emotional_score(wellbeing_history):
         return 75
     scores = [w.get("emotionalWellbeingScore", 0.5) for w in wellbeing_history]
     return int((sum(scores) / len(scores)) * 100)
+
